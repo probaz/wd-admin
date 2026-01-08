@@ -1,345 +1,507 @@
-// src/pages/Dashboard.jsx
 import { useState, useEffect } from 'react';
-import axios from '../utils/axios';
-import { 
-  UsersIcon, 
-  ShoppingBagIcon, 
-  CubeIcon, 
-  CurrencyDollarIcon,
-  UserGroupIcon,
-  ArchiveBoxIcon,
-  ChartBarIcon,
-  BuildingStorefrontIcon,
-  CheckCircleIcon,
-  ClockIcon,
-  PhoneIcon
-} from '@heroicons/react/24/outline';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar } from 'recharts';
-import Loading from '../components/Loading';
-import Error from '../components/Error';
+import {
+  Users,
+  DollarSign,
+  TrendingUp,
+  ShoppingBag,
+  Calendar,
+  RefreshCw
+} from 'lucide-react';
+import Layout from '../components/layout/Layout';
+import StatCard from '../components/dashboard/StatCard';
+import Card from '../components/common/Card';
+import Button from '../components/common/Button';
+import { BarChart, Bar, LineChart, Line, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
+import { useWebSocket } from '../contexts/WebSocketContext';
+import { useNotification } from '../contexts/NotificationContext';
+import { formatCurrency, formatNumber } from '../utils/formatters';
+import { analyticsAPI, customerAPI, employeeAPI, gymAPI } from '../services/api';
+import './Dashboard.css';
 
-const StatCard = ({ title, value, icon: Icon, trend, prefix = '', info }) => (
-  <div className="bg-white rounded-lg shadow p-6">
-    <div className="flex items-center">
-      <div className="flex-shrink-0">
-        <Icon className="h-6 w-6 text-primary-600" />
-      </div>
-      <div className="ml-4">
-        <h3 className="text-sm font-medium text-gray-500">{title}</h3>
-        <p className="text-2xl font-semibold text-gray-900">
-          {prefix}{typeof value === 'number' ? value.toLocaleString() : value}
-        </p>
-        {trend && (
-          <p className={`text-sm ${trend > 0 ? 'text-green-600' : 'text-red-600'}`}>
-            {trend > 0 ? '↑' : '↓'} {Math.abs(trend)}% from last month
-          </p>
-        )}
-        {info && <p className="text-xs text-gray-500 mt-1">{info}</p>}
-      </div>
-    </div>
-  </div>
-);
-
-export default function Dashboard() {
-  const [dashboardData, setDashboardData] = useState({
-    stats: {
-      totalUsers: 0,
-      totalShops: 0,
-      totalProducts: 0,
-      totalTransactions: 0,
-      totalEcocashTransactions: 0,
-      pendingEcocashTransactions: 0,
-      totalAmount: 0,
-      totalEcocashAmount: 0,
-      activeUsers: 0,
-      userTrend: 0,
-      pendingTargetUsers: 0,
-      readyForRedemptionUsers: 0,
-      totalTargetAmount: 0,
-      startedPayingUsers: 0,
-      startedPaymentFulfillment: 0,
-      redemptionCount: 0,
-      recentTransactions: []
-    },
-    charts: {
-      transactions: [],
-      productPopularity: []
-    }
+const transformRevenueTrend = (trend = []) => {
+  if (!Array.isArray(trend)) return [];
+  return trend.map(entry => {
+    const date = entry.date || entry._id?.date || entry._id;
+    const revenue = entry.totalRevenue ?? entry.revenue ?? entry.total ?? entry.amount ?? 0;
+    const transactions = entry.transactions ?? entry.transactionCount ?? entry.count ?? 0;
+    return {
+      date,
+      totalRevenue: revenue,
+      transactions
+    };
   });
+};
+
+const buildSafeDataFromAnalytics = (data = {}) => {
+  const customers = data.customers || data.customerMetrics || {};
+  const employees = data.employees || data.employeeStats || [];
+  const memberships = data.memberships || {};
+  const revenue = data.revenue || {};
+
+  return {
+    customerMetrics: {
+      totalCustomers: customers.totalCustomers || 0,
+      newCustomers: customers.newCustomers || 0,
+      averageLoyaltyPoints: customers.averageLoyaltyPoints || 0
+    },
+    employeeStats: {
+      totalEmployees: Array.isArray(employees)
+        ? employees.reduce((sum, emp) => sum + (emp.count || 0), 0)
+        : employees.totalEmployees || 0
+    },
+    membershipMetrics: (Array.isArray(memberships.byType) && memberships.byType.length > 0)
+      ? memberships.byType.map(item => ({
+          type: item._id || item.type || 'active',
+          count: item.count || 0
+        }))
+      : (data.membershipMetrics || [{ type: 'active', count: data.activeMemberships || memberships.total || 0 }]),
+    revenueByBusinessUnit: revenue.byBusinessUnit || data.revenueByBusinessUnit || [],
+    revenueTrend: transformRevenueTrend(revenue.trend || data.revenueTrend || []),
+    revenueTotal: revenue.total || 0
+  };
+};
+
+const buildSafeDataFallback = (customersCount, employeesCount, membershipsCount) => ({
+  customerMetrics: {
+    totalCustomers: customersCount
+  },
+  employeeStats: {
+    totalEmployees: employeesCount
+  },
+  membershipMetrics: [{ type: 'active', count: membershipsCount }],
+  revenueByBusinessUnit: [],
+  revenueTrend: [],
+  revenueTotal: 0
+});
+
+const Dashboard = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const { connected, subscribeToInventoryLowStock } = useWebSocket();
+  const { warning, info } = useNotification();
+
+  // Real data states
+  const [dashboardData, setDashboardData] = useState({
+    stats: [],
+    revenueData: [],
+    businessUnitData: [],
+    customerActivityData: [],
+    recentActivities: [],
+    upcomingEvents: []
+  });
 
   useEffect(() => {
     fetchDashboardData();
   }, []);
 
+  // Subscribe to real-time updates
+  useEffect(() => {
+    if (!connected) return;
+
+    const unsubscribe = subscribeToInventoryLowStock((data) => {
+      warning(`Low stock alert: ${data.itemName}`, 8000);
+    });
+
+    return () => unsubscribe && unsubscribe();
+  }, [connected, subscribeToInventoryLowStock, warning]);
+
   const fetchDashboardData = async () => {
     try {
       setLoading(true);
-      const [statsRes, chartsRes] = await Promise.all([
-        axios.get('/admin_innovations/dashboard/stats'),
-        axios.get('/admin_innovations/dashboard/charts')
-      ]);
+      setError(null);
+
+      let safeData = {};
+
+      // Try to fetch from analytics API first
+      try {
+        const response = await analyticsAPI.getExecutiveDashboard();
+        const payload = response?.data ?? response;
+        const data = payload?.data || payload || {};
+
+        if (payload?.success === false && Object.keys(data).length === 0) {
+          throw new Error('Analytics API returned unsuccessful response');
+        }
+
+        safeData = buildSafeDataFromAnalytics(data);
+      } catch (analyticsError) {
+        console.warn('Analytics API unavailable, fetching from individual endpoints:', analyticsError.message);
+
+        // Fallback: Fetch from individual endpoints
+        const [customersRes, employeesRes, membershipsRes] = await Promise.allSettled([
+          customerAPI.getAll({ limit: 1 }),
+          employeeAPI.getAll({ limit: 1 }),
+          gymAPI.getMemberships({ limit: 1 })
+        ]);
+
+        // Debug: Log the actual responses
+        console.log('Customers Response:', customersRes);
+        console.log('Employees Response:', employeesRes);
+        console.log('Memberships Response:', membershipsRes);
+
+        // Extract counts from responses (matching Customers.jsx pattern)
+        const getCustomerCount = () => {
+          if (customersRes.status !== 'fulfilled') return 0;
+          const res = customersRes.value;
+          return res?.pagination?.total || res?.data?.customers?.length || res?.customers?.length || 0;
+        };
+
+        const getEmployeeCount = () => {
+          if (employeesRes.status !== 'fulfilled') return 0;
+          const res = employeesRes.value;
+          return res?.pagination?.total || res?.data?.employees?.length || res?.employees?.length || 0;
+        };
+
+        const getMembershipCount = () => {
+          if (membershipsRes.status !== 'fulfilled') return 0;
+          const res = membershipsRes.value;
+          return res?.pagination?.total || res?.data?.memberships?.length || res?.memberships?.length || 0;
+        };
+
+        // Build safeData from individual responses
+        safeData = buildSafeDataFallback(
+          getCustomerCount(),
+          getEmployeeCount(),
+          getMembershipCount()
+        );
+
+        console.log('Processed safeData:', safeData);
+      }
+
+      const stats = [
+        {
+          title: 'Total Customers',
+          value: formatNumber(safeData.customerMetrics?.totalCustomers || 0),
+          icon: Users,
+          trend: 'up',
+          trendValue: '0',
+          color: 'var(--primary-color)'
+        },
+        {
+          title: 'Monthly Revenue',
+          value: formatCurrency(safeData.revenueTotal || safeData.revenueByBusinessUnit?.reduce((sum, bu) => sum + (bu.totalRevenue || 0), 0) || 0),
+          icon: DollarSign,
+          trend: 'up',
+          trendValue: '0',
+          color: 'var(--success)'
+        },
+        {
+          title: 'Active Memberships',
+          value: formatNumber(safeData.membershipMetrics?.reduce((sum, m) => sum + (m.count || 0), 0) || 0),
+          icon: TrendingUp,
+          trend: 'up',
+          trendValue: '0',
+          color: 'var(--gym-color)'
+        },
+        {
+          title: 'Total Employees',
+          value: formatNumber(safeData.employeeStats?.totalEmployees || 0),
+          icon: ShoppingBag,
+          trend: 'up',
+          trendValue: '0',
+          color: 'var(--manufacturing-color)'
+        }
+      ];
+
+      // Process revenue trend data (last 6 months)
+      const revenueData = processRevenueTrendData(safeData.revenueTrend || []);
+
+      // Process business unit data
+      const businessUnitData = processBusinessUnitData(safeData.revenueByBusinessUnit || []);
+
+      // Process customer activity (last 7 days from revenue trend)
+      const customerActivityData = processCustomerActivityData(safeData.revenueTrend || []);
+
+      // Get recent activities from transaction history if available
+      const recentActivities = [];
+
+      // Get upcoming events from appointments if available
+      const upcomingEvents = [];
 
       setDashboardData({
-        stats: statsRes.data,
-        charts: chartsRes.data
+        stats,
+        revenueData,
+        businessUnitData,
+        customerActivityData,
+        recentActivities,
+        upcomingEvents
       });
-      setError(null);
-    } catch (err) {
-      console.error('Dashboard data error:', err);
-      setError(err.response?.data?.message || 'Failed to load dashboard data');
-    } finally {
+
       setLoading(false);
+    } catch (err) {
+      console.error('Dashboard data fetch error:', err);
+      setError('Failed to load dashboard data. Please try refreshing.');
+      setLoading(false);
+
+      // Set empty data on error
+      setDashboardData({
+        stats: [
+          { title: 'Total Customers', value: '0', icon: Users, trend: 'up', trendValue: '0', color: 'var(--primary-color)' },
+          { title: 'Monthly Revenue', value: formatCurrency(0), icon: DollarSign, trend: 'up', trendValue: '0', color: 'var(--success)' },
+          { title: 'Active Memberships', value: '0', icon: TrendingUp, trend: 'up', trendValue: '0', color: 'var(--gym-color)' },
+          { title: 'Total Employees', value: '0', icon: ShoppingBag, trend: 'up', trendValue: '0', color: 'var(--manufacturing-color)' }
+        ],
+        revenueData: [],
+        businessUnitData: [],
+        customerActivityData: [],
+        recentActivities: [],
+        upcomingEvents: []
+      });
     }
   };
 
-  const formatDate = (date) => {
-    return new Date(date).toLocaleDateString('en-US', {
-      month: 'short',
-      day: 'numeric'
+  // Helper function to process revenue trend data
+  const processRevenueTrendData = (revenueTrend) => {
+    if (!revenueTrend || revenueTrend.length === 0) return [];
+
+    // Get last 6 months
+    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    const last6Months = revenueTrend.slice(-180); // Approximately 6 months of daily data
+
+    // Group by month
+    const monthlyData = {};
+    last6Months.forEach(day => {
+      const date = new Date(day.date);
+      if (isNaN(date)) {
+        return;
+      }
+      const monthKey = months[date.getMonth()];
+
+      if (!monthlyData[monthKey]) {
+        monthlyData[monthKey] = { month: monthKey, revenue: 0, expenses: 0 };
+      }
+
+      monthlyData[monthKey].revenue += day.totalRevenue || day.revenue || 0;
+      // Note: expenses data not available in current API, setting to 0
+      monthlyData[monthKey].expenses += 0;
     });
+
+    return Object.values(monthlyData);
   };
 
-  const formatCurrency = (amount) => {
-    return new Intl.NumberFormat('en-US', {
-      style: 'currency',
-      currency: 'USD',
-      minimumFractionDigits: 2
-    }).format(amount);
-  };
+  // Helper function to process business unit data
+  const processBusinessUnitData = (revenueByBusinessUnit) => {
+    if (!revenueByBusinessUnit || revenueByBusinessUnit.length === 0) return [];
 
-  const formatCompactCurrency = (amount) => {
-    if (amount === undefined || amount === null) return '$0';
-    
-    const abs = Math.abs(amount);
-    const sign = amount < 0 ? '-' : '';
-    const trim = (value) => {
-      const rounded = value >= 10 ? Math.round(value) : Number(value.toFixed(1));
-      return rounded.toString().replace(/\.0$/, '');
+    const businessUnitColors = {
+      'gym': 'var(--gym-color)',
+      'spa': 'var(--spa-color)',
+      'salon': 'var(--salon-color)',
+      'restaurant': 'var(--restaurant-color)',
+      'childcare': 'var(--childcare-color)',
+      'manufacturing': 'var(--manufacturing-color)'
     };
 
-    if (abs >= 1_000_000_000) return `${sign}$${trim(abs / 1_000_000_000)}B+`;
-    if (abs >= 1_000_000) return `${sign}$${trim(abs / 1_000_000)}M+`;
-    if (abs >= 1_000) return `${sign}$${trim(abs / 1_000)}k+`;
-    return `${sign}$${abs.toLocaleString()}`;
+    const businessUnitNames = {
+      'gym': 'The Ring (Gym)',
+      'spa': 'The Olive Room (Spa)',
+      'salon': 'Salon',
+      'restaurant': 'Restaurant',
+      'childcare': 'Childcare',
+      'manufacturing': 'Manufacturing'
+    };
+
+    return revenueByBusinessUnit.map(bu => ({
+      name: businessUnitNames[bu._id] || bu._id,
+      value: bu.totalRevenue || 0,
+      color: businessUnitColors[bu._id] || 'var(--gray-400)'
+    }));
   };
 
-  if (loading) return <Loading />;
-  if (error) return <Error message={error} />;
+  // Helper function to process customer activity (last 7 days)
+  const processCustomerActivityData = (revenueTrend) => {
+    if (!revenueTrend || revenueTrend.length === 0) return [];
 
-  const { stats, charts } = dashboardData;
+    const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    const last7Days = revenueTrend.slice(-7);
+
+    return last7Days.map(day => {
+      const date = new Date(day.date);
+      if (isNaN(date)) {
+        return null;
+      }
+      return {
+        day: days[date.getDay()],
+        customers: day.transactions || day.transactionCount || 0
+      };
+    }).filter(Boolean);
+  };
+
+  const handleRefresh = async () => {
+    setRefreshing(true);
+    await fetchDashboardData();
+    setRefreshing(false);
+    info('Dashboard refreshed', 2000);
+  };
+
+  const { stats, revenueData, businessUnitData, customerActivityData, recentActivities, upcomingEvents } = dashboardData;
 
   return (
-    <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-semibold text-gray-900">Dashboard</h1>
-        <p className="mt-1 text-sm text-gray-500">Overview of system performance and metrics</p>
+    <Layout title="Dashboard" subtitle="Welcome back! Here's what's happening with your business">
+      {error && (
+        <div className="alert alert-warning mb-lg">
+          {error}
+        </div>
+      )}
+
+      <div className="dashboard-header mb-lg">
+        <Button
+          variant="secondary"
+          icon={RefreshCw}
+          onClick={handleRefresh}
+          loading={refreshing}
+          disabled={loading}
+        >
+          Refresh
+        </Button>
+        {connected && (
+          <span className="connection-status">
+            <span className="status-dot online"></span>
+            Real-time updates active
+          </span>
+        )}
       </div>
 
-      {/* Main Stats */}
-      <div className="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-5">
-        <StatCard
-          title="Total Users"
-          value={stats.totalUsers}
-          icon={UsersIcon}
-          trend={stats.userTrend}
-          info={`${stats.activeUsers} active users`}
-        />
-        <StatCard
-          title="Total Target Amount"
-          value={formatCompactCurrency(stats.totalTargetAmount)}
-          icon={CurrencyDollarIcon}
-          info={`${stats.readyForRedemptionUsers} users ready for redemption`}
-        />
-        <StatCard
-          title="Pending Target Users"
-          value={stats.pendingTargetUsers}
-          icon={ClockIcon}
-          info="Users still saving toward target"
-        />
-        <StatCard
-          title="Started Payments"
-          value={stats.startedPayingUsers}
-          icon={UserGroupIcon}
-          info={`Remaining to fulfill: ${formatCurrency(stats.startedPaymentFulfillment)}`}
-        />
-        <StatCard
-          title="Seed Redemptions"
-          value={stats.redemptionCount}
-          icon={CheckCircleIcon}
-          info="Seeds redeemed at shops"
-        />
-      </div>
+      <div className="dashboard">
+        {/* Stats Grid */}
+        <div className="grid grid-4 mb-xl">
+          {stats.map((stat, index) => (
+            <StatCard key={index} {...stat} loading={loading} />
+          ))}
+        </div>
 
-      {/* Secondary Stats */}
-      <div className="grid grid-cols-1 gap-6 sm:grid-cols-3 lg:grid-cols-3">
-        <StatCard
-          title="Active Shops"
-          value={stats.totalShops}
-          icon={BuildingStorefrontIcon}
-        />
-        <StatCard
-          title="Available Products"
-          value={stats.totalProducts}
-          icon={CubeIcon}
-        />
-        <StatCard
-          title="EcoCash Top-Ups"
-          value={stats.totalEcocashTransactions}
-          icon={PhoneIcon}
-          info={`${formatCurrency(stats.totalEcocashAmount)} total volume`}
-        />
-      </div>
+        {/* Charts Row */}
+        <div className="grid grid-2 mb-xl">
+          <Card title="Revenue Overview" subtitle="Last 6 months">
+            <ResponsiveContainer width="100%" height={300}>
+              <BarChart data={revenueData}>
+                <CartesianGrid strokeDasharray="3 3" stroke="var(--gray-200)" />
+                <XAxis dataKey="month" stroke="var(--gray-400)" />
+                <YAxis stroke="var(--gray-400)" />
+                <Tooltip
+                  contentStyle={{
+                    background: 'var(--white)',
+                    border: '1px solid var(--gray-200)',
+                    borderRadius: 'var(--radius-lg)'
+                  }}
+                />
+                <Legend />
+                <Bar dataKey="revenue" fill="var(--primary-color)" radius={[8, 8, 0, 0]} />
+                <Bar dataKey="expenses" fill="var(--accent-gold)" radius={[8, 8, 0, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          </Card>
 
-      {/* Charts */}
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-        {/* Transaction History Chart */}
-        <div className="bg-white rounded-lg shadow p-6">
-          <h2 className="text-lg font-medium text-gray-900 mb-4">Top-Ups vs Redemptions</h2>
-          <div className="h-80">
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart
-                data={charts.transactions}
-                margin={{ top: 5, right: 30, left: 20, bottom: 5 }}
-              >
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis 
-                  dataKey="date" 
-                  tickFormatter={formatDate}
+          <Card title="Business Unit Performance" subtitle="Revenue distribution">
+            <ResponsiveContainer width="100%" height={300}>
+              <PieChart>
+                <Pie
+                  data={businessUnitData}
+                  cx="50%"
+                  cy="50%"
+                  labelLine={false}
+                  label={({ name, percent }) => `${name}: ${(percent * 100).toFixed(0)}%`}
+                  outerRadius={100}
+                  fill="#8884d8"
+                  dataKey="value"
+                >
+                  {businessUnitData.map((entry, index) => (
+                    <Cell key={`cell-${index}`} fill={entry.color} />
+                  ))}
+                </Pie>
+                <Tooltip />
+              </PieChart>
+            </ResponsiveContainer>
+          </Card>
+        </div>
+
+        {/* Weekly Activity */}
+        <div className="grid grid-1 mb-xl">
+          <Card title="Weekly Customer Activity" subtitle="Customer visits per day">
+            <ResponsiveContainer width="100%" height={250}>
+              <LineChart data={customerActivityData}>
+                <CartesianGrid strokeDasharray="3 3" stroke="var(--gray-200)" />
+                <XAxis dataKey="day" stroke="var(--gray-400)" />
+                <YAxis stroke="var(--gray-400)" />
+                <Tooltip
+                  contentStyle={{
+                    background: 'var(--white)',
+                    border: '1px solid var(--gray-200)',
+                    borderRadius: 'var(--radius-lg)'
+                  }}
                 />
-                <YAxis 
-                  tickFormatter={(value) => formatCurrency(value).replace('$', '')}
-                />
-                <Tooltip 
-                  formatter={(value) => formatCurrency(value)}
-                  labelFormatter={formatDate}
-                />
-                <Line 
-                  name="Top-Ups"
-                  type="monotone" 
-                  dataKey="topupAmount" 
-                  stroke="#0891b2" 
-                  strokeWidth={2}
-                  dot={false}
-                />
-                <Line 
-                  name="Redemptions"
-                  type="monotone" 
-                  dataKey="redemptionAmount" 
-                  stroke="#16a34a" 
-                  strokeWidth={2}
-                  dot={false}
+                <Line
+                  type="monotone"
+                  dataKey="customers"
+                  stroke="var(--primary-color)"
+                  strokeWidth={3}
+                  dot={{ fill: 'var(--primary-color)', r: 6 }}
+                  activeDot={{ r: 8 }}
                 />
               </LineChart>
             </ResponsiveContainer>
-          </div>
+          </Card>
         </div>
 
-        {/* Product Popularity Chart */}
-        <div className="bg-white rounded-lg shadow p-6">
-          <h2 className="text-lg font-medium text-gray-900 mb-4">Popular Products</h2>
-          <div className="h-80">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart
-                data={charts.productPopularity}
-                margin={{ top: 5, right: 30, left: 20, bottom: 5 }}
-              >
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis 
-                  dataKey="name" 
-                  angle={-45}
-                  textAnchor="end"
-                  height={80}
-                />
-                <YAxis />
-                <Tooltip />
-                <Bar 
-                  dataKey="count" 
-                  fill="#16a34a"
-                  name="Orders"
-                />
-                <Bar 
-                  dataKey="totalQuantity" 
-                  fill="#22c55e"
-                  name="Total Quantity"
-                />
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
-        </div>
-      </div>
-
-      {/* Recent Transactions */}
-      <div className="bg-white rounded-lg shadow overflow-hidden">
-        <div className="px-6 py-4 border-b border-gray-200">
-          <h2 className="text-lg font-medium text-gray-900">Recent Activity</h2>
-        </div>
-        <div className="divide-y divide-gray-200">
-          {stats.recentTransactions && stats.recentTransactions.length > 0 ? (
-            stats.recentTransactions.map((transaction) => (
-              <div key={transaction._id} className="px-6 py-4">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <div className="flex items-center">
-                      <p className="text-sm font-medium text-gray-900">
-                        {transaction.userId?.fullName || 'Unknown User'}
-                      </p>
-                      <p className="ml-2 text-sm text-gray-500">
-                        ({transaction.userId?.phone || 'No Phone'})
-                      </p>
+        {/* Recent Activities and Upcoming Events */}
+        <div className="grid grid-2">
+          <Card title="Recent Activities" subtitle="Latest updates across all business units">
+            <div className="activity-list">
+              {recentActivities.length > 0 ? (
+                recentActivities.map((activity, index) => {
+                  const Icon = activity.icon;
+                  return (
+                    <div key={index} className="activity-item">
+                      <div className="activity-icon" style={{ background: activity.color }}>
+                        <Icon size={18} />
+                      </div>
+                      <div className="activity-content">
+                        <h4>{activity.title}</h4>
+                        <p>{activity.description}</p>
+                      </div>
+                      <span className="activity-time">{activity.time}</span>
                     </div>
-                    <p className="text-sm text-gray-500">
-                      {new Date(transaction.date).toLocaleDateString('en-US', {
-                        year: 'numeric',
-                        month: 'short',
-                        day: 'numeric',
-                        hour: '2-digit',
-                        minute: '2-digit'
-                      })}
-                    </p>
-                    {transaction.shopId && (
-                      <p className="text-xs text-primary-600 mt-1">
-                        Shop: {transaction.shopId.name}
-                      </p>
-                    )}
-                  </div>
-                  <div className="flex flex-col items-end">
-                    <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${
-                      transaction.type === 'topup' 
-                        ? 'bg-green-100 text-green-800' 
-                        : transaction.type === 'redemption'
-                        ? 'bg-blue-100 text-blue-800'
-                        : transaction.type === 'purchase'
-                        ? 'bg-purple-100 text-purple-800'
-                        : 'bg-gray-100 text-gray-800'
-                    }`}>
-                      {transaction.type === 'topup' ? 'Top Up' : 
-                       transaction.type === 'redemption' ? 'Seed Redemption' : 
-                       transaction.type === 'purchase' ? 'Purchase' :
-                       transaction.type}
-                      {transaction.amount ? ` (${formatCurrency(transaction.amount)})` : ''}
-                    </span>
-                    <span className={`mt-1 text-xs ${
-                      transaction.status === 'COMPLETED' ? 'text-green-600' : 
-                      transaction.status === 'PENDING SUBSCRIBER VALIDATION' ? 'text-blue-600' :
-                      transaction.status === 'PENDING' ? 'text-yellow-600' : 'text-red-600'
-                    }`}>
-                      {transaction.status === 'PENDING SUBSCRIBER VALIDATION' 
-                        ? 'Awaiting EcoCash PIN' 
-                        : transaction.status}
-                    </span>
-                  </div>
+                  );
+                })
+              ) : (
+                <div className="empty-state" style={{ padding: '2rem', textAlign: 'center', color: 'var(--gray-400)' }}>
+                  <p>No recent activities to display</p>
                 </div>
-              </div>
-            ))
-          ) : (
-            <div className="px-6 py-4 text-center text-gray-500">
-              No recent transactions
+              )}
             </div>
-          )}
+          </Card>
+
+          <Card title="Upcoming Events" subtitle="Scheduled activities">
+            <div className="events-list">
+              {upcomingEvents.length > 0 ? (
+                upcomingEvents.map((event, index) => (
+                  <div key={index} className="event-item">
+                    <div className="event-date">
+                      <div className="event-day">{event.date}</div>
+                      <div className="event-month">{event.month}</div>
+                    </div>
+                    <div className="event-content">
+                      <h4>{event.title}</h4>
+                      <div className="event-details">
+                        <Calendar size={14} />
+                        <span>{event.time}</span>
+                        <span className="event-dot">•</span>
+                        <span>{event.type}</span>
+                      </div>
+                    </div>
+                  </div>
+                ))
+              ) : (
+                <div className="empty-state" style={{ padding: '2rem', textAlign: 'center', color: 'var(--gray-400)' }}>
+                  <p>No upcoming events scheduled</p>
+                </div>
+              )}
+            </div>
+          </Card>
         </div>
       </div>
-    </div>
+    </Layout>
   );
-}
+};
+
+export default Dashboard;
